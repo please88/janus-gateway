@@ -1,5 +1,9 @@
 Janus WebRTC Server
 ===================
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-brightgreen.svg)](COPYING)
+[![Build Status](https://travis-ci.org/meetecho/janus-gateway.svg?branch=master)](https://travis-ci.org/meetecho/janus-gateway)
+[![Coverity Scan Build Status](https://scan.coverity.com/projects/13265/badge.svg)](https://scan.coverity.com/projects/meetecho-janus-gateway)
+[![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/janus-gateway.svg)](https://bugs.chromium.org/p/oss-fuzz/issues/list?sort=-opened&can=1&q=proj:janus-gateway)
 
 Janus is an open source, general purpose, WebRTC server designed and developed by [Meetecho](http://www.meetecho.com). This version of the server is tailored for Linux systems, although it can be compiled for, and installed on, MacOS machines as well. Windows is not supported, but if that's a requirement, Janus is known to work in the "Windows Subsystem for Linux" on Windows 10.
 
@@ -13,11 +17,11 @@ To install it, you'll need to satisfy the following dependencies:
 
 * [Jansson](http://www.digip.org/jansson/)
 * [libconfig](https://hyperrealm.github.io/libconfig/)
-* [libnice](http://nice.freedesktop.org/wiki/) (at least v0.1.13 suggested, master recommended)
+* [libnice](http://nice.freedesktop.org/wiki/) (at least v0.1.16 suggested, master recommended)
 * [OpenSSL](http://www.openssl.org/) (at least v1.0.1e)
 * [libsrtp](https://github.com/cisco/libsrtp) (at least v1.5 suggested)
 * [usrsctp](https://github.com/sctplab/usrsctp) (only needed if you are interested in Data Channels)
-* [libmicrohttpd](http://www.gnu.org/software/libmicrohttpd/) (only needed if you are interested in REST support for the Janus API)
+* [libmicrohttpd](http://www.gnu.org/software/libmicrohttpd/) (at least v0.9.59; only needed if you are interested in REST support for the Janus API)
 * [libwebsockets](https://libwebsockets.org/) (only needed if you are interested in WebSockets support for the Janus API)
 * [cmake](http://www.cmake.org/) (only needed if you are interested in WebSockets and/or BoringSSL support, as they make use of it)
 * [rabbitmq-c](https://github.com/alanxz/rabbitmq-c) (only needed if you are interested in RabbitMQ support for the Janus API or events)
@@ -36,6 +40,7 @@ A couple of plugins depend on a few more libraries:
 Additionally, you'll need the following libraries and tools:
 
 * [GLib](http://library.gnome.org/devel/glib/)
+* [zlib](https://zlib.net/)
 * [pkg-config](http://www.freedesktop.org/wiki/Software/pkg-config/)
 * [gengetopt](http://www.gnu.org/software/gengetopt/)
 
@@ -85,7 +90,9 @@ The instructions for version 2.x are practically the same. Notice that the follo
 	./configure --prefix=/usr --enable-openssl
 	make shared_library && sudo make install
 
-The Janus configure script autodetects which one you have installed and links to the correct library automatically, choosing 2.x if both are installed. If you want 1.5 or 1.6 to be picked, pass `--disable-libsrtp2` when configuring Janus to force it to use the older version instead.
+Notice that the `--enable-openssl` part is _important_, as it's needed for AES-GCM support. As an alternative, you can also pass `--enable-nss` to have libsrtp use NSS instead of OpenSSL. A failure to configure libsrtp with either might cause undefined references when starting Janus, as we'd be trying to use methods that aren't there.
+
+The Janus configure script autodetects which one you have installed and links to the correct library automatically, choosing 2.x if both are installed. If you want 1.5 or 1.6 to be picked (which is NOT recommended), pass `--disable-libsrtp2` when configuring Janus to force it to use the older version instead.
 
 * *Note:* when installing libsrtp, no matter which version, you may need to pass `--libdir=/usr/lib64` to the configure script if you're installing on a x86_64 distribution.
 
@@ -193,7 +200,7 @@ Since Janus requires configuration files for both the core and its modules in or
 
 	make configs
 
-Remember to only do this once, or otherwise a subsequent `make configs` will overwrite any configuration file you may have modified in themeanwhile.
+Remember to only do this once, or otherwise a subsequent `make configs` will overwrite any configuration file you may have modified in the meanwhile.
 
 If you've installed the above libraries but are not interested, for instance, in Data Channels, WebSockets, MQTT and/or RabbitMQ, you can disable them when configuring:
 
@@ -228,13 +235,11 @@ Everything else works exactly the same way as on Linux.
 ## Configure and start
 To start the server, you can use the `janus` executable. There are several things you can configure, either in a configuration file:
 
-	<installdir>/etc/janus/janus.cfg
+	<installdir>/etc/janus/janus.jcfg
 
 or on the command line:
 
 	<installdir>/bin/janus --help
-
-	janus 0.7.0
 
 	Usage: janus [OPTIONS]...
 
@@ -246,6 +251,8 @@ or on the command line:
                                   (default=none)
 	-N, --disable-stdout          Disable stdout based logging  (default=off)
 	-L, --log-file=path           Log to the specified file (default=stdout only)
+	-H  --cwd-path                Working directory for Janus daemon process
+	                              (default=/)
 	-i, --interface=ipaddress     Interface to use (will be the public IP)
 	-P, --plugins-folder=path     Plugins folder (default=./plugins)
 	-C, --config=filename         Configuration file to use
@@ -278,17 +285,18 @@ or on the command line:
 	-T, --ice-tcp                 Whether to enable ICE-TCP or not (warning: only
                                   works with ICE Lite)
                                   (default=off)
-	-R, --rfc-4588                Whether to enable RFC4588 retransmissions
-                                  support or not  (default=off)
-	-q, --max-nack-queue=number   Maximum size of the NACK queue (in ms) per user
-                                  for retransmissions
+	-Q, --min-nack-queue=number   Minimum size of the NACK queue (in ms) per user
+                                  for retransmissions, no matter the RTT
 	-t, --no-media-timer=number   Time (in s) that should pass with no media
                                   (audio or video) being received before Janus
                                   notifies you about this
+	-W, --slowlink-threshold=number
+                                  Number of lost packets (per s) that should
+                                  trigger a 'slowlink' Janus API event to users
 	-r, --rtp-port-range=min-max  Port range to use for RTP/RTCP (only available
 								  if the installed libnice supports it)
 	-B, --twcc-period=number      How often (in ms) to send TWCC feedback back to
-                                  senders, if negotiated (default=1s)
+                                  senders, if negotiated (default=200ms)
 	-n, --server-name=name        Public name of this Janus instance
                                   (default=MyJanusInstance)
 	-s, --session-timeout=number  Session timeout value, in seconds (default=60)

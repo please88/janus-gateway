@@ -16,8 +16,8 @@
  * \ref protocols
  */
 
-#ifndef _JANUS_SCTP_H
-#define _JANUS_SCTP_H
+#ifndef JANUS_SCTP_H
+#define JANUS_SCTP_H
 
 #ifdef HAVE_SCTP
 
@@ -56,8 +56,8 @@ void janus_sctp_deinit(void);
 
 
 #define BUFFER_SIZE (1<<16)
-#define NUMBER_OF_CHANNELS (100)
-#define NUMBER_OF_STREAMS (16)
+#define NUMBER_OF_CHANNELS (150)
+#define NUMBER_OF_STREAMS (300)
 
 #define DATA_CHANNEL_PPID_CONTROL           50
 #define DATA_CHANNEL_PPID_DOMSTRING         51
@@ -203,9 +203,10 @@ void janus_sctp_data_from_dtls(janus_sctp_association *sctp, char *buf, int len)
 /*! \brief Method to send data via SCTP to the peer
  * \param[in] sctp The SCTP association this data is from
  * @param[in] label The label of the data channel to use
+ * @param[in] textdata Whether the buffer is text (domstring) or binary data
  * \param[in] buf The data buffer
  * \param[in] len The buffer length */
-void janus_sctp_send_data(janus_sctp_association *sctp, char *label, char *buf, int len);
+void janus_sctp_send_data(janus_sctp_association *sctp, char *label, gboolean textdata, char *buf, int len);
 
 #endif
 

@@ -140,10 +140,11 @@ const char *janus_echotest_get_author(void);
 const char *janus_echotest_get_package(void);
 void janus_echotest_create_session(janus_plugin_session *handle, int *error);
 struct janus_plugin_result *janus_echotest_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
+json_t *janus_echotest_handle_admin_message(json_t *message);
 void janus_echotest_setup_media(janus_plugin_session *handle);
-void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_echotest_incoming_data(janus_plugin_session *handle, char *label, char *buf, int len);
+void janus_echotest_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet);
+void janus_echotest_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet);
+void janus_echotest_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet);
 void janus_echotest_slow_link(janus_plugin_session *handle, int uplink, int video);
 void janus_echotest_hangup_media(janus_plugin_session *handle);
 void janus_echotest_destroy_session(janus_plugin_session *handle, int *error);
@@ -165,6 +166,7 @@ static janus_plugin janus_echotest_plugin =
 
 		.create_session = janus_echotest_create_session,
 		.handle_message = janus_echotest_handle_message,
+		.handle_admin_message = janus_echotest_handle_admin_message,
 		.setup_media = janus_echotest_setup_media,
 		.incoming_rtp = janus_echotest_incoming_rtp,
 		.incoming_rtcp = janus_echotest_incoming_rtcp,
@@ -462,6 +464,8 @@ json_t *janus_echotest_query_session(janus_plugin_session *handle) {
 		json_object_set_new(info, "substream-target", json_integer(session->sim_context.substream_target));
 		json_object_set_new(info, "temporal-layer", json_integer(session->sim_context.templayer));
 		json_object_set_new(info, "temporal-layer-target", json_integer(session->sim_context.templayer_target));
+		if(session->sim_context.drop_trigger > 0)
+			json_object_set_new(info, "fallback", json_integer(session->sim_context.drop_trigger));
 	}
 	if(session->arc || session->vrc || session->drc) {
 		json_t *recording = json_object();
@@ -502,6 +506,13 @@ struct janus_plugin_result *janus_echotest_handle_message(janus_plugin_session *
 	return janus_plugin_result_new(JANUS_PLUGIN_OK_WAIT, "I'm taking my time!", NULL);
 }
 
+json_t *janus_echotest_handle_admin_message(json_t *message) {
+	/* Just here as a proof of concept: since there's nothing to configure,
+	 * as an EchoTest plugin we echo this Admin request back as well */
+	json_t *response = json_deep_copy(message);
+	return response;
+}
+
 void janus_echotest_setup_media(janus_plugin_session *handle) {
 	JANUS_LOG(LOG_INFO, "[%s-%p] WebRTC media is now available\n", JANUS_ECHOTEST_PACKAGE, handle);
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
@@ -522,7 +533,7 @@ void janus_echotest_setup_media(janus_plugin_session *handle) {
 	/* We really don't care, as we only send RTP/RTCP we get in the first place back anyway */
 }
 
-void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_echotest_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Simple echo test */
@@ -535,6 +546,9 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 		}
 		if(g_atomic_int_get(&session->destroyed))
 			return;
+		gboolean video = packet->video;
+		char *buf = packet->buffer;
+		uint16_t len = packet->length;
 		if(video && session->video_active && (session->ssrc[0] != 0 || session->rid[0] != NULL)) {
 			/* Handle simulcast: backup the header information first */
 			janus_rtp_header *header = (janus_rtp_header *)buf;
@@ -544,6 +558,10 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 			/* Process this packet: don't relay if it's not the SSRC/layer we wanted to handle */
 			gboolean relay = janus_rtp_simulcasting_context_process_rtp(&session->sim_context,
 				buf, len, session->ssrc, session->rid, session->vcodec, &session->context);
+			if(session->sim_context.need_pli) {
+				/* Send a PLI */
+				gateway->send_pli(handle);
+			}
 			/* Do we need to drop this? */
 			if(!relay)
 				return;
@@ -556,14 +574,6 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 				json_object_set_new(event, "substream", json_integer(session->sim_context.substream));
 				gateway->push_event(handle, &janus_echotest_plugin, NULL, event, NULL);
 				json_decref(event);
-			}
-			if(session->sim_context.need_pli) {
-				/* Send a PLI */
-				JANUS_LOG(LOG_VERB, "We need a PLI for the simulcast context\n");
-				char rtcpbuf[12];
-				memset(rtcpbuf, 0, 12);
-				janus_rtcp_pli((char *)&rtcpbuf, 12);
-				gateway->relay_rtcp(handle, 1, rtcpbuf, 12);
 			}
 			if(session->sim_context.changed_temporal) {
 				/* Notify the user about the temporal layer change */
@@ -585,7 +595,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 			header->ssrc = htonl(1);
 			janus_recorder_save_frame(session->vrc, buf, len);
 			/* Send the frame back */
-			gateway->relay_rtp(handle, video, buf, len);
+			gateway->relay_rtp(handle, packet);
 			/* Restore header or core statistics will be messed up */
 			header->ssrc = htonl(ssrc);
 			header->timestamp = htonl(timestamp);
@@ -595,13 +605,13 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 				/* Save the frame if we're recording */
 				janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
 				/* Send the frame back */
-				gateway->relay_rtp(handle, video, buf, len);
+				gateway->relay_rtp(handle, packet);
 			}
 		}
 	}
 }
 
-void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_echotest_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Simple echo test */
@@ -613,22 +623,19 @@ void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char 
 		}
 		if(g_atomic_int_get(&session->destroyed))
 			return;
-		guint32 bitrate = janus_rtcp_get_remb(buf, len);
+		guint32 bitrate = janus_rtcp_get_remb(packet->buffer, packet->length);
 		if(bitrate > 0) {
 			/* If a REMB arrived, make sure we cap it to our configuration, and send it as a video RTCP */
 			session->peer_bitrate = bitrate;
-			if(session->bitrate == 0)	/* No limit ~= 10000000 */
-				janus_rtcp_cap_remb(buf, len, 10000000);
-			else
-				janus_rtcp_cap_remb(buf, len, session->bitrate);
-			gateway->relay_rtcp(handle, 1, buf, len);
+			/* No limit ~= 10000000 */
+			gateway->send_remb(handle, session->bitrate ? session->bitrate : 10000000);
 			return;
 		}
-		gateway->relay_rtcp(handle, video, buf, len);
+		gateway->relay_rtcp(handle, packet);
 	}
 }
 
-void janus_echotest_incoming_data(janus_plugin_session *handle, char *label, char *buf, int len) {
+void janus_echotest_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Simple echo test */
@@ -640,8 +647,20 @@ void janus_echotest_incoming_data(janus_plugin_session *handle, char *label, cha
 		}
 		if(g_atomic_int_get(&session->destroyed))
 			return;
-		if(buf == NULL || len <= 0)
+		if(packet->buffer == NULL || packet->length == 0)
 			return;
+		char *label = packet->label;
+		char *buf = packet->buffer;
+		uint16_t len = packet->length;
+		if(packet->binary) {
+			JANUS_LOG(LOG_VERB, "Got a binary DataChannel message (label=%s, %d bytes) to bounce back\n", label, len);
+			/* Save the frame if we're recording */
+			janus_recorder_save_frame(session->drc, buf, len);
+			/* Binary data, shoot back as it is */
+			gateway->relay_data(handle, packet);
+			return;
+		}
+		/* Text data */
 		char *text = g_malloc(len+1);
 		memcpy(text, buf, len);
 		*(text+len) = '\0';
@@ -653,7 +672,14 @@ void janus_echotest_incoming_data(janus_plugin_session *handle, char *label, cha
 		char *reply = g_malloc(strlen(prefix)+len+1);
 		g_snprintf(reply, strlen(prefix)+len+1, "%s%s", prefix, text);
 		g_free(text);
-		gateway->relay_data(handle, label, reply, strlen(reply));
+		/* Prepare the packet and send it back */
+		janus_plugin_data r = {
+			.label = label,
+			.binary = FALSE,
+			.buffer = reply,
+			.length = strlen(reply)
+		};
+		gateway->relay_data(handle, &r);
 		g_free(reply);
 	}
 }
@@ -691,8 +717,11 @@ void janus_echotest_slow_link(janus_plugin_session *handle, int uplink, int vide
 			json_t *event = json_object();
 			json_object_set_new(event, "echotest", json_string("event"));
 			json_object_set_new(event, "event", json_string("slow_link"));
-			/* Also add info on what the current bitrate cap is */
-			json_object_set_new(event, "current-bitrate", json_integer(session->bitrate));
+			json_object_set_new(event, "media", json_string(video ? "video" : "audio"));
+			if(video) {
+				/* Also add info on what the current bitrate cap is */
+				json_object_set_new(event, "current-bitrate", json_integer(session->bitrate));
+			}
 			gateway->push_event(session->handle, &janus_echotest_plugin, NULL, event, NULL);
 			json_decref(event);
 		}
@@ -826,9 +855,10 @@ static void *janus_echotest_handler(void *data) {
 		json_t *msg_simulcast = json_object_get(msg->jsep, "simulcast");
 		if(msg_simulcast) {
 			JANUS_LOG(LOG_VERB, "EchoTest client is going to do simulcasting\n");
-			int rid_ext_id = -1;
-			janus_rtp_simulcasting_prepare(msg_simulcast, &rid_ext_id, session->ssrc, session->rid);
+			int rid_ext_id = -1, framemarking_ext_id = -1;
+			janus_rtp_simulcasting_prepare(msg_simulcast, &rid_ext_id, &framemarking_ext_id, session->ssrc, session->rid);
 			session->sim_context.rid_ext_id = rid_ext_id;
+			session->sim_context.framemarking_ext_id = framemarking_ext_id;
 			session->sim_context.substream_target = 2;	/* Let's aim for the highest quality */
 			session->sim_context.templayer_target = 2;	/* Let's aim for all temporal layers */
 		}
@@ -865,6 +895,13 @@ static void *janus_echotest_handler(void *data) {
 			JANUS_LOG(LOG_ERR, "Invalid element (temporal should be 0, 1 or 2)\n");
 			error_code = JANUS_ECHOTEST_ERROR_INVALID_ELEMENT;
 			g_snprintf(error_cause, 512, "Invalid value (temporal should be 0, 1 or 2)");
+			goto error;
+		}
+		json_t *fallback = json_object_get(root, "fallback");
+		if(fallback && (!json_is_integer(fallback) || json_integer_value(fallback) < 0)) {
+			JANUS_LOG(LOG_ERR, "Invalid element (fallback should be a positive integer)\n");
+			error_code = JANUS_ECHOTEST_ERROR_INVALID_ELEMENT;
+			g_snprintf(error_cause, 512, "Invalid value (fallback should be a positive integer)");
 			goto error;
 		}
 		json_t *record = json_object_get(root, "record");
@@ -904,10 +941,7 @@ static void *janus_echotest_handler(void *data) {
 			if(!session->video_active && json_is_true(video)) {
 				/* Send a PLI */
 				JANUS_LOG(LOG_VERB, "Just (re-)enabled video, sending a PLI to recover it\n");
-				char buf[12];
-				memset(buf, 0, 12);
-				janus_rtcp_pli((char *)&buf, 12);
-				gateway->relay_rtcp(session->handle, 1, buf, 12);
+				gateway->send_pli(session->handle);
 			}
 			session->video_active = json_is_true(video);
 			JANUS_LOG(LOG_VERB, "Setting video property: %s\n", session->video_active ? "true" : "false");
@@ -915,12 +949,13 @@ static void *janus_echotest_handler(void *data) {
 		if(bitrate) {
 			session->bitrate = json_integer_value(bitrate);
 			JANUS_LOG(LOG_VERB, "Setting video bitrate: %"SCNu32"\n", session->bitrate);
-			if(session->bitrate > 0) {
-				char buf[24];
-				janus_rtcp_remb((char *)&buf, 24, session->bitrate);
-				JANUS_LOG(LOG_VERB, "Sending REMB\n");
-				gateway->relay_rtcp(session->handle, 1, buf, 24);
-			}
+			gateway->send_remb(session->handle, session->bitrate ? session->bitrate : 10000000);
+		}
+		if(fallback) {
+			JANUS_LOG(LOG_VERB, "Setting fallback timer (simulcast): %lld (was %"SCNu32")\n",
+				json_integer_value(fallback) ? json_integer_value(fallback) : 250000,
+				session->sim_context.drop_trigger ? session->sim_context.drop_trigger : 250000);
+			session->sim_context.drop_trigger = json_integer_value(fallback);
 		}
 		if(substream) {
 			session->sim_context.substream_target = json_integer_value(substream);
@@ -937,10 +972,7 @@ static void *janus_echotest_handler(void *data) {
 			} else {
 				/* We need to change substream, send a PLI */
 				JANUS_LOG(LOG_VERB, "Simulcasting substream change, sending a PLI to kickstart it\n");
-				char buf[12];
-				memset(buf, 0, 12);
-				janus_rtcp_pli((char *)&buf, 12);
-				gateway->relay_rtcp(session->handle, 1, buf, 12);
+				gateway->send_pli(session->handle);
 			}
 		}
 		if(temporal) {
@@ -958,10 +990,7 @@ static void *janus_echotest_handler(void *data) {
 			} else {
 				/* We need to change temporal, send a PLI */
 				JANUS_LOG(LOG_VERB, "Simulcasting temporal layer change, sending a PLI to kickstart it\n");
-				char buf[12];
-				memset(buf, 0, 12);
-				janus_rtcp_pli((char *)&buf, 12);
-				gateway->relay_rtcp(session->handle, 1, buf, 12);
+				gateway->send_pli(session->handle);
 			}
 		}
 
@@ -973,10 +1002,10 @@ static void *janus_echotest_handler(void *data) {
 			session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
 		}
 
-		if(!audio && !video && !bitrate && !substream && !temporal && !record && !msg_sdp) {
-			JANUS_LOG(LOG_ERR, "No supported attributes (audio, video, bitrate, substream, temporal, record, jsep) found\n");
+		if(!audio && !video && !bitrate && !substream && !temporal && !fallback && !record && !msg_sdp) {
+			JANUS_LOG(LOG_ERR, "No supported attributes (audio, video, bitrate, substream, temporal, fallback, record, jsep) found\n");
 			error_code = JANUS_ECHOTEST_ERROR_INVALID_ELEMENT;
-			g_snprintf(error_cause, 512, "Message error: no supported attributes (audio, video, bitrate, simulcast, temporal, record, jsep) found");
+			g_snprintf(error_cause, 512, "Message error: no supported attributes (audio, video, bitrate, simulcast, temporal, fallback, record, jsep) found");
 			goto error;
 		}
 
@@ -1029,6 +1058,9 @@ static void *janus_echotest_handler(void *data) {
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_MID,
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_RID,
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_REPAIRED_RID,
+				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_AUDIO_LEVEL,
+				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_VIDEO_ORIENTATION,
+				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_FRAME_MARKING,
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_TRANSPORT_WIDE_CC,
 				JANUS_SDP_OA_DONE);
 			/* If we ended up sendonly, switch to inactive (as we don't really send anything ourselves) */
@@ -1126,10 +1158,7 @@ static void *janus_echotest_handler(void *data) {
 					}
 					/* Send a PLI */
 					JANUS_LOG(LOG_VERB, "Recording video, sending a PLI to kickstart it\n");
-					char buf[12];
-					memset(buf, 0, 12);
-					janus_rtcp_pli((char *)&buf, 12);
-					gateway->relay_rtcp(session->handle, 1, buf, 12);
+					gateway->send_pli(session->handle);
 				}
 				if(session->has_data) {
 					memset(filename, 0, 255);

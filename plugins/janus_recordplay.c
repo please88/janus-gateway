@@ -12,7 +12,8 @@
  * features: it allows you to record a message you send with WebRTC in
  * the format defined in recorded.c (MJR recording) and subsequently
  * replay this recording (or other previously recorded) through WebRTC
- * as well.
+ * as well. For more information on how Janus implements recordings
+ * natively and the MJR format, refer to the \ref recordings documentation.
  *
  * This application aims at showing how easy recording frames sent by
  * a peer is, and how this recording can be re-used directly, without
@@ -38,8 +39,8 @@
  * 		[12345678]
  * 		name = My videoroom recording
  * 		date = 2014-10-14 17:11:26
- * 		audio = mcu-audio.mjr
- * 		video = mcu-video.mjr
+ * 		audio = videoroom-audio.mjr
+ * 		video = videoroom-video.mjr
  *
  * \section recplayapi Record&Play API
  *
@@ -292,9 +293,10 @@ const char *janus_recordplay_get_author(void);
 const char *janus_recordplay_get_package(void);
 void janus_recordplay_create_session(janus_plugin_session *handle, int *error);
 struct janus_plugin_result *janus_recordplay_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
+json_t *janus_recordplay_handle_admin_message(json_t *message);
 void janus_recordplay_setup_media(janus_plugin_session *handle);
-void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_recordplay_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
+void janus_recordplay_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet);
+void janus_recordplay_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet);
 void janus_recordplay_slow_link(janus_plugin_session *handle, int uplink, int video);
 void janus_recordplay_hangup_media(janus_plugin_session *handle);
 void janus_recordplay_destroy_session(janus_plugin_session *handle, int *error);
@@ -316,6 +318,7 @@ static janus_plugin janus_recordplay_plugin =
 
 		.create_session = janus_recordplay_create_session,
 		.handle_message = janus_recordplay_handle_message,
+		.handle_admin_message = janus_recordplay_handle_admin_message,
 		.setup_media = janus_recordplay_setup_media,
 		.incoming_rtp = janus_recordplay_incoming_rtp,
 		.incoming_rtcp = janus_recordplay_incoming_rtcp,
@@ -625,10 +628,12 @@ static int janus_recordplay_generate_offer(janus_recordplay_recording *rec) {
 		JANUS_SDP_OA_AUDIO_CODEC, janus_audiocodec_name(rec->acodec),
 		JANUS_SDP_OA_AUDIO_PT, rec->audio_pt,
 		JANUS_SDP_OA_AUDIO_DIRECTION, JANUS_SDP_SENDONLY,
+		JANUS_SDP_OA_AUDIO_EXTENSION, JANUS_RTP_EXTMAP_MID, 1,
 		JANUS_SDP_OA_VIDEO, offer_video,
 		JANUS_SDP_OA_VIDEO_CODEC, janus_videocodec_name(rec->vcodec),
 		JANUS_SDP_OA_VIDEO_PT, rec->video_pt,
 		JANUS_SDP_OA_VIDEO_DIRECTION, JANUS_SDP_SENDONLY,
+		JANUS_SDP_OA_VIDEO_EXTENSION, JANUS_RTP_EXTMAP_MID, 1,
 		JANUS_SDP_OA_DATA, FALSE,
 		JANUS_SDP_OA_DONE);
 	g_free(rec->offer);
@@ -1052,6 +1057,46 @@ plugin_response:
 
 }
 
+json_t *janus_recordplay_handle_admin_message(json_t *message) {
+	/* Some requests (e.g., 'update') can be handled via Admin API */
+	int error_code = 0;
+	char error_cause[512];
+	json_t *response = NULL;
+
+	JANUS_VALIDATE_JSON_OBJECT(message, request_parameters,
+		error_code, error_cause, TRUE,
+		JANUS_RECORDPLAY_ERROR_MISSING_ELEMENT, JANUS_RECORDPLAY_ERROR_INVALID_ELEMENT);
+	if(error_code != 0)
+		goto admin_response;
+	json_t *request = json_object_get(message, "request");
+	const char *request_text = json_string_value(request);
+	if(!strcasecmp(request_text, "update")) {
+		/* Update list of available recordings, scanning the folder again */
+		janus_recordplay_update_recordings_list();
+		/* Send info back */
+		response = json_object();
+		json_object_set_new(response, "recordplay", json_string("ok"));
+		goto admin_response;
+	} else {
+		JANUS_LOG(LOG_VERB, "Unknown request '%s'\n", request_text);
+		error_code = JANUS_RECORDPLAY_ERROR_INVALID_REQUEST;
+		g_snprintf(error_cause, 512, "Unknown request '%s'", request_text);
+	}
+
+admin_response:
+		{
+			if(!response) {
+				/* Prepare JSON error event */
+				response = json_object();
+				json_object_set_new(response, "recordplay", json_string("event"));
+				json_object_set_new(response, "error_code", json_integer(error_code));
+				json_object_set_new(response, "error", json_string(error_cause));
+			}
+			return response;
+		}
+
+}
+
 void janus_recordplay_setup_media(janus_plugin_session *handle) {
 	JANUS_LOG(LOG_INFO, "[%s-%p] WebRTC media is now available\n", JANUS_RECORDPLAY_PACKAGE, handle);
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
@@ -1091,7 +1136,6 @@ void janus_recordplay_send_rtcp_feedback(janus_plugin_session *handle, int video
 		return;	/* We just do this for video, for now */
 
 	janus_recordplay_session *session = (janus_recordplay_session *)handle->plugin_handle;
-	char rtcpbuf[24];
 
 	/* Send a RR+SDES+REMB every five seconds, or ASAP while we are still
 	 * ramping up (first 4 RTP packets) */
@@ -1108,9 +1152,7 @@ void janus_recordplay_send_rtcp_feedback(janus_plugin_session *handle, int video
 		}
 
 		/* Send a new REMB back */
-		char rtcpbuf[24];
-		janus_rtcp_remb((char *)(&rtcpbuf), 24, bitrate);
-		gateway->relay_rtcp(handle, video, rtcpbuf, 24);
+		gateway->send_remb(handle, bitrate);
 
 		session->video_remb_last = now;
 	}
@@ -1120,16 +1162,13 @@ void janus_recordplay_send_rtcp_feedback(janus_plugin_session *handle, int video
 	gint64 interval = (gint64)(session->video_keyframe_interval / 1000) * G_USEC_PER_SEC;
 
 	if(elapsed >= interval) {
-		/* Send both a FIR and a PLI, just to be sure */
-		janus_rtcp_fir((char *)&rtcpbuf, 20, &session->video_fir_seq);
-		gateway->relay_rtcp(handle, video, rtcpbuf, 20);
-		janus_rtcp_pli((char *)&rtcpbuf, 12);
-		gateway->relay_rtcp(handle, video, rtcpbuf, 12);
+		/* Send a PLI */
+		gateway->send_pli(handle);
 		session->video_keyframe_request_last = now;
 	}
 }
 
-void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_recordplay_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	janus_recordplay_session *session = (janus_recordplay_session *)handle->plugin_handle;
@@ -1141,6 +1180,9 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
 		return;
 	if(!session->recorder || !session->recording)
 		return;
+	gboolean video = packet->video;
+	char *buf = packet->buffer;
+	uint16_t len = packet->length;
 	if(video && (session->ssrc[0] != 0 || session->rid[0] != NULL)) {
 		/* Handle simulcast: backup the header information first */
 		janus_rtp_header *header = (janus_rtp_header *)buf;
@@ -1150,17 +1192,14 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
 		/* Process this packet: don't save if it's not the SSRC/layer we wanted to handle */
 		gboolean save = janus_rtp_simulcasting_context_process_rtp(&session->sim_context,
 			buf, len, session->ssrc, session->rid, session->recording->vcodec, &session->context);
-		/* Do we need to drop this? */
-		if(!save)
-			return;
 		if(session->sim_context.need_pli) {
 			/* Send a PLI */
 			JANUS_LOG(LOG_VERB, "We need a PLI for the simulcast context\n");
-			char rtcpbuf[12];
-			memset(rtcpbuf, 0, 12);
-			janus_rtcp_pli((char *)&rtcpbuf, 12);
-			gateway->relay_rtcp(handle, 1, rtcpbuf, 12);
+			gateway->send_pli(handle);
 		}
+		/* Do we need to drop this? */
+		if(!save)
+			return;
 		/* If we got here, update the RTP header and save the packet */
 		janus_rtp_header_update(header, &session->context, TRUE, 0);
 		if(session->recording->vcodec == JANUS_VIDEOCODEC_VP8) {
@@ -1185,13 +1224,13 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
 	janus_recordplay_send_rtcp_feedback(handle, video, buf, len);
 }
 
-void janus_recordplay_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_recordplay_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 }
 
 void janus_recordplay_slow_link(janus_plugin_session *handle, int uplink, int video) {
-	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized) || !gateway)
+	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 
 	janus_mutex_lock(&sessions_mutex);
@@ -1207,8 +1246,10 @@ void janus_recordplay_slow_link(janus_plugin_session *handle, int uplink, int vi
 	json_object_set_new(event, "recordplay", json_string("event"));
 	json_t *result = json_object();
 	json_object_set_new(result, "status", json_string("slow_link"));
+	json_object_set_new(result, "media", json_string(video ? "video" : "audio"));
+	if(video)
+		json_object_set_new(result, "current-bitrate", json_integer(session->video_bitrate));
 	/* What is uplink for the server is downlink for the client, so turn the tables */
-	json_object_set_new(result, "current-bitrate", json_integer(session->video_bitrate));
 	json_object_set_new(result, "uplink", json_integer(uplink ? 0 : 1));
 	json_object_set_new(event, "result", result);
 	gateway->push_event(session->handle, &janus_recordplay_plugin, NULL, event, NULL);
@@ -1552,6 +1593,7 @@ recdone:
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_MID,
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_RID,
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_REPAIRED_RID,
+				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_FRAME_MARKING,
 				JANUS_SDP_OA_ACCEPT_EXTMAP, JANUS_RTP_EXTMAP_TRANSPORT_WIDE_CC,
 				JANUS_SDP_OA_DONE);
 			g_free(answer->s_name);
@@ -1570,9 +1612,10 @@ recdone:
 			json_t *msg_simulcast = json_object_get(msg->jsep, "simulcast");
 			if(msg_simulcast) {
 				JANUS_LOG(LOG_VERB, "Recording client negotiated simulcasting\n");
-				int rid_ext_id = -1;
-				janus_rtp_simulcasting_prepare(msg_simulcast, &rid_ext_id, session->ssrc, session->rid);
+				int rid_ext_id = -1, framemarking_ext_id = -1;
+				janus_rtp_simulcasting_prepare(msg_simulcast, &rid_ext_id, &framemarking_ext_id, session->ssrc, session->rid);
 				session->sim_context.rid_ext_id = rid_ext_id;
+				session->sim_context.framemarking_ext_id = framemarking_ext_id;
 				session->sim_context.substream_target = 2;	/* Let's aim for the highest quality */
 				session->sim_context.templayer_target = 2;	/* Let's aim for all temporal layers */
 				if(rec->vcodec != JANUS_VIDEOCODEC_VP8 && rec->vcodec != JANUS_VIDEOCODEC_H264) {
@@ -2358,7 +2401,9 @@ static void *janus_recordplay_playout_thread(void *data) {
 				/* Update payload type */
 				janus_rtp_header *rtp = (janus_rtp_header *)buffer;
 				rtp->type = audio_pt;
-				gateway->relay_rtp(session->handle, 0, (char *)buffer, bytes);
+				janus_plugin_rtp prtp = { .video = FALSE, .buffer = (char *)buffer, .length = bytes };
+				janus_plugin_rtp_extensions_reset(&prtp.extensions);
+				gateway->relay_rtp(session->handle, &prtp);
 				gettimeofday(&now, NULL);
 				abefore.tv_sec = now.tv_sec;
 				abefore.tv_usec = now.tv_usec;
@@ -2398,7 +2443,9 @@ static void *janus_recordplay_playout_thread(void *data) {
 					/* Update payload type */
 					janus_rtp_header *rtp = (janus_rtp_header *)buffer;
 					rtp->type = audio_pt;
-					gateway->relay_rtp(session->handle, 0, (char *)buffer, bytes);
+					janus_plugin_rtp prtp = { .video = FALSE, .buffer = (char *)buffer, .length = bytes };
+					janus_plugin_rtp_extensions_reset(&prtp.extensions);
+					gateway->relay_rtp(session->handle, &prtp);
 					asent = TRUE;
 					audio = audio->next;
 				}
@@ -2416,7 +2463,9 @@ static void *janus_recordplay_playout_thread(void *data) {
 					/* Update payload type */
 					janus_rtp_header *rtp = (janus_rtp_header *)buffer;
 					rtp->type = video_pt;
-					gateway->relay_rtp(session->handle, 1, (char *)buffer, bytes);
+					janus_plugin_rtp prtp = { .video = TRUE, .buffer = (char *)buffer, .length = bytes };
+					janus_plugin_rtp_extensions_reset(&prtp.extensions);
+					gateway->relay_rtp(session->handle, &prtp);
 					video = video->next;
 				}
 				vsent = TRUE;
@@ -2460,7 +2509,9 @@ static void *janus_recordplay_playout_thread(void *data) {
 						/* Update payload type */
 						janus_rtp_header *rtp = (janus_rtp_header *)buffer;
 						rtp->type = video_pt;
-						gateway->relay_rtp(session->handle, 1, (char *)buffer, bytes);
+						janus_plugin_rtp prtp = { .video = TRUE, .buffer = (char *)buffer, .length = bytes };
+						janus_plugin_rtp_extensions_reset(&prtp.extensions);
+						gateway->relay_rtp(session->handle, &prtp);
 						video = video->next;
 					}
 					vsent = TRUE;

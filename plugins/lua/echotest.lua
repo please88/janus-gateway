@@ -142,6 +142,13 @@ function handleMessage(id, tr, msg, jsep)
 	end
 end
 
+function handleAdminMessage(message)
+	-- This is just to showcase how you can handle incoming messages
+	-- coming from the Admin API: we return the same message as a test
+	logger.print("Got admin message: " .. dumpTable(message))
+	return message;
+end
+
 function setupMedia(id)
 	-- WebRTC is now available
 	logger.print("WebRTC PeerConnection is up for session: " .. id)
@@ -162,11 +169,16 @@ function hangupMedia(id)
 	end
 end
 
-function incomingData(id, buf, len)
+function incomingTextData(id, buf, len)
 	-- Relaying RTP/RTCP in Lua makes no sense, but just for fun
-	-- we handle data channel messages ourselves to manipulate them
+	-- we handle text data channel messages ourselves to manipulate them
 	local edit = "[" .. name .. "] --> " .. buf
-	relayData(id, edit, string.len(edit));
+	relayTextData(id, edit, string.len(edit));
+end
+
+function incomingBinaryData(id, buf, len)
+	-- If the data we're getting is binary, send it back as it is
+	relayBinaryData(id, buf, len);
 end
 
 function resumeScheduler()
@@ -226,7 +238,7 @@ function processRequest(id, msg)
 			"audio", "opus", "/tmp", fnbase .. "-audio",
 			"video", "vp8", "/tmp", fnbase .. "-video",
 			"data", "text", "/tmp", fnbase .. "-data"
-		) 
+		)
 	elseif msg["record"] == false then
 		stopRecording(id, "audio", "video", "data")
 	end

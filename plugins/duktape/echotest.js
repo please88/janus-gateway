@@ -7,8 +7,8 @@
 name = "echotest.js";
 
 // Let's add more info to errors
-Error.prototype.toString = function () { 
-	return this.name + ': ' + this.message + ' (at line ' + this.lineNumber + ')'; 
+Error.prototype.toString = function () {
+	return this.name + ': ' + this.message + ' (at line ' + this.lineNumber + ')';
 };
 // Let's add a prefix to all console.log lines
 var originalConsoleLog = console.log;
@@ -146,6 +146,13 @@ function handleMessage(id, tr, msg, jsep) {
 	}
 }
 
+function handleAdminMessage(message) {
+	// This is just to showcase how you can handle incoming messages
+	// coming from the Admin API: we return the same message as a test
+	console.log("Got admin message:", message);
+	return message;
+}
+
 function setupMedia(id) {
 	// WebRTC is now available
 	console.log("WebRTC PeerConnection is up for session:", id);
@@ -166,11 +173,16 @@ function hangupMedia(id) {
 	}
 }
 
-function incomingData(id, buf, len) {
+function incomingTextData(id, buf, len) {
 	// Relaying RTP/RTCP in JavaScript makes no sense, but just for fun
 	// we handle data channel messages ourselves to manipulate them
 	var edit = "[" + name + "] --> " + buf;
-	relayData(id, edit, edit.length);
+	relayTextData(id, edit, edit.length);
+}
+
+function incomingBinaryData(id, buf, len) {
+	// If the data we're getting is binary, send it back as it is
+	relayBinaryData(id, buf, len);
 }
 
 function resumeScheduler() {

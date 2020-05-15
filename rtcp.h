@@ -13,8 +13,8 @@
  * \ref protocols
  */
 
-#ifndef _JANUS_RTCP_H
-#define _JANUS_RTCP_H
+#ifndef JANUS_RTCP_H
+#define JANUS_RTCP_H
 
 #include <arpa/inet.h>
 #ifdef __MACH__
@@ -276,6 +276,9 @@ typedef struct rtcp_context
 	double in_media_link_quality;
 	double out_link_quality;
 	double out_media_link_quality;
+
+	/* TODO Incoming transport-wide CC feedback*/
+
 } rtcp_context;
 typedef rtcp_context janus_rtcp_context;
 
@@ -319,6 +322,12 @@ uint32_t janus_rtcp_context_get_out_link_quality(janus_rtcp_context *ctx);
  * @param[in] ctx The RTCP context to query
  * @returns Outbound media link quality estimation */
 uint32_t janus_rtcp_context_get_out_media_link_quality(janus_rtcp_context *ctx);
+/*! \brief Method to swap Report Blocks and move media RB in first position in case rtx SSRC comes first
+ * @param[in] packet The message data
+ * @param[in] len The message data length in bytes
+ * @param[in] rtx_ssrc The rtx SSRC
+ * @returns The receiver SSRC, or 0 in case of error */
+void janus_rtcp_swap_report_blocks(char *packet, int len, uint32_t rtx_ssrc);
 /*! \brief Method to quickly retrieve the sender SSRC (needed for demuxing RTCP in BUNDLE)
  * @param[in] packet The message data
  * @param[in] len The message data length in bytes
@@ -408,8 +417,11 @@ char *janus_rtcp_filter(char *packet, int len, int *newlen);
  * @param[in] rfc4588_pkt True if this is a RTX packet
  * @param[in] rfc4588_enabled True if this packet comes from a RTX enabled stream
  * @param[in] retransmissions_disabled True if retransmissions are not supported at all for this stream
+ * @param[in] clock_rates Mapping between payload types and clock rates, if available
  * @returns 0 in case of success, -1 on errors */
-int janus_rtcp_process_incoming_rtp(janus_rtcp_context *ctx, char *packet, int len, gboolean rfc4588_pkt, gboolean rfc4588_enabled, gboolean retransmissions_disabled);
+int janus_rtcp_process_incoming_rtp(janus_rtcp_context *ctx, char *packet, int len,
+	gboolean rfc4588_pkt, gboolean rfc4588_enabled, gboolean retransmissions_disabled,
+	GHashTable *clock_rates);
 
 /*! \brief Method to fill in a Report Block in a Receiver Report
  * @param[in] ctx The RTCP context to use for the report
